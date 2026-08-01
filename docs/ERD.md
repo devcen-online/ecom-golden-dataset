@@ -216,7 +216,7 @@ relationships:
 - INV-3 (multi-unit/multi-offer, FR-005/BDD S-8): каждый товар имеет офферы от ≥ 1 unit, при этом существуют товары с офферами от ≥ 2 разных unit; первый оффер товара всегда принадлежит unit-владельцу товара.
 - INV-4 (ссылочная целостность): `offer.product_id`, `product.category_id`, `offer.category_id` всегда ссылаются на существующие сущности; `product.offer_ids` в точности равен набору офферов с данным `product_id` (в том же порядке).
 - INV-5 (счётчики): `len(dataset.offers) == sum(len(p.offer_ids))`; ID офферов и товаров уникальны и возрастают (продукт: 1..N, оффер: 1..M).
-- INV-6 (агрегат, FR-004-смежное): `offer.aggregate_version >= 1` и монотонен для каждого (product_id, unit_id) — имитирует поток событий каталога для тестов projection.
+- INV-6 (агрегат, envelope EVENTS-001 §1 / short-plan §2): `offer.aggregate_version >= 1` и монотонен для каждого (product_id, unit_id) — имитирует поток событий каталога для тестов projection.
 - INV-7 (тенант): `offer.seller_id` детерминированно выводится из `offer.unit_id` (`seller-<unit_id>`), чтобы тесты изоляции тенантов были воспроизводимы.
 
 ## 5. Стратегия миграций
