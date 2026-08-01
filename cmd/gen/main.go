@@ -2,70 +2,36 @@
 //
 // Детерминизм: одинаковый seed всегда даёт байт-идентичный датасет
 // (порядок обхода категорий и офферов фиксирован, случайность — только
-// внутри генератора с заданным seed).
+// внутри генератора с заданным seed). Строковые seed (BDD-032#S-9,
+// например "catalog-2026-08") детерминированно хэшируются в int64 (FNV-1a).
 package main
 
 import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"math/rand"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/devcen-online/ecom-golden-dataset/internal/model"
 )
-
-type Category struct {
-	ID       int      `json:"id"`
-	Name     string   `json:"name"`
-	ParentID *int     `json:"parent_id,omitempty"`
-	Units    []string `json:"units"`
-}
-
-type Offer struct {
-	ID           int      `json:"id"`
-	ProductID    int      `json:"product_id"`
-	UnitID       string   `json:"unit_id"`
-	CategoryID   int      `json:"category_id"`
-	Name         string   `json:"name"`
-	Price        int      `json:"price"`
-	Stock        int      `json:"stock"`
-	AggregateVer int      `json:"aggregate_version"`
-	SellerID     string   `json:"seller_id"`
-	ProductName  string   `json:"product_name"`
-	Vendor       string   `json:"vendor"`
-	Keywords     []string `json:"keywords"`
-}
-
-type Product struct {
-	ID         int      `json:"id"`
-	CategoryID int      `json:"category_id"`
-	Name       string   `json:"name"`
-	UnitID     string   `json:"unit_id"`
-	OfferIDs   []int    `json:"offer_ids"`
-}
-
-type Dataset struct {
-	Seed       int        `json:"seed"`
-	Generated  string     `json:"generated"`
-	Categories []Category `json:"categories"`
-	Products   []Product  `json:"products"`
-	Offers     []Offer    `json:"offers"`
-}
 
 const (
 	minProducts  = 1000
-	minOffers    = 3
 	unitCount    = 4
 	categoryRoot = 1
 )
 
 func main() {
-	var seed int
+	var seedStr string
 	var out string
 	var products int
-	flag.IntVar(&seed, "seed", 42, "seed детерминированной генерации")
+	flag.StringVar(&seedStr, "seed", "42", "seed детерминированной генерации (int или строка)")
 	flag.IntVar(&products, "products", minProducts, "количество товаров (минимум 1000)")
 	flag.StringVar(&out, "out", "dataset.json", "путь к файлу датасета")
 	flag.Parse()
@@ -74,6 +40,7 @@ func main() {
 		log.Fatalf("products должен быть >= %d, получено %d", minProducts, products)
 	}
 
+	seed := parseSeed(seedStr)
 	ds := generate(seed, products)
 
 	data, err := json.MarshalIndent(ds, "", "  ")
@@ -83,20 +50,31 @@ func main() {
 	if err := os.WriteFile(out, data, 0o644); err != nil {
 		log.Fatalf("write %s: %v", out, err)
 	}
-	fmt.Printf("ok: %d товаров, %d офферов, %d категорий, %d unit -> %s\n",
-		len(ds.Products), len(ds.Offers), len(ds.Categories), unitCount, out)
+	fmt.Printf("ok: seed %d (%q), %d товаров, %d офферов, %d категорий, %d unit -> %s\n",
+		ds.Seed, seedStr, len(ds.Products), len(ds.Offers), len(ds.Categories), unitCount, out)
 }
 
-func generate(seed, products int) *Dataset {
-	r := rand.New(rand.NewSource(int64(seed)))
+// parseSeed превращает seed-аргумент в int64: целые числа — как есть,
+// строки — детерминированным FNV-1a-хэшем (одинакова на всех платформах).
+func parseSeed(s string) int64 {
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return i
+	}
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return int64(h.Sum64())
+}
+
+func generate(seed int64, products int) *model.Dataset {
+	r := rand.New(rand.NewSource(seed))
 
 	cats := buildCategories(r)
-	ds := &Dataset{
-		Seed:       seed,
+	ds := &model.Dataset{
+		Seed:       int(seed),
 		Generated:  "deterministic",
 		Categories: cats,
-		Products:   make([]Product, 0, products),
-		Offers:     make([]Offer, 0, products*minOffers),
+		Products:   make([]model.Product, 0, products),
+		Offers:     make([]model.Offer, 0, products*minOffers),
 	}
 
 	productID := 0
@@ -105,27 +83,31 @@ func generate(seed, products int) *Dataset {
 		productID++
 		cat := cats[p%len(cats)]
 
-		// Собираем продавцов офферов: 1 владелец (unit товара) + от 1 до 3
-		// других unit, так что один товар может иметь офферы >= 2 unit
-		// (multi-unit/multi-offer кейсы из FR-005).
-		unitsForProduct := make([]string, 0, unitCount+2)
-		unitsForProduct = append(unitsForProduct, cat.Units[0])
-		extra := 1 + r.Intn(3)
+		// Владелец товара меняется по unit-ам, чтобы товары каталога
+		// принадлежали нескольким unit (BDD-032#S-8).
+		owner := cat.Units[p%len(cat.Units)]
+
+		// Продавцы офферов: владелец + 0..3 других unit (всего 1..4 unit
+		// на товар, ERD-001: «от 1 до 4 разных unit»). Индексы
+		// (p+i) % len(cat.Units) гарантируют различность unit в наборе.
+		extra := 1 + r.Intn(unitCount) // 1..4 — общее число unit на товар
+		unitsForProduct := make([]string, 0, extra)
+		unitsForProduct = append(unitsForProduct, owner)
 		for i := 1; i < extra; i++ {
-			unitsForProduct = append(unitsForProduct, cat.Units[i%len(cat.Units)])
+			unitsForProduct = append(unitsForProduct, cat.Units[(p+i)%len(cat.Units)])
 		}
 
-		product := Product{
+		product := model.Product{
 			ID:         productID,
 			CategoryID: cat.ID,
 			Name:       fmt.Sprintf("Товар %d", productID),
-			UnitID:     unitsForProduct[0],
+			UnitID:     owner,
 			OfferIDs:   make([]int, 0, len(unitsForProduct)),
 		}
 
 		for _, u := range unitsForProduct {
 			offerID++
-			o := Offer{
+			o := model.Offer{
 				ID:           offerID,
 				ProductID:    productID,
 				UnitID:       u,
@@ -153,18 +135,20 @@ func generate(seed, products int) *Dataset {
 	return ds
 }
 
+const minOffers = 1
+
 var vendors = []string{"VendorA", "VendorB", "VendorC", "VendorD"}
 
-func buildCategories(r *rand.Rand) []Category {
-	cats := make([]Category, 0, 30)
+func buildCategories(r *rand.Rand) []model.Category {
+	cats := make([]model.Category, 0, 30)
 	catID := 0
 	next := func() int { catID++; return catID }
 
-	root := Category{ID: next(), Name: "Каталог", Units: unitList(0)}
+	root := model.Category{ID: next(), Name: "Каталог", Units: unitList(0)}
 	cats = append(cats, root)
 
 	for i := 0; i < 28; i++ {
-		c := Category{
+		c := model.Category{
 			ID:       next(),
 			Name:     categoryNames[r.Intn(len(categoryNames))] + fmt.Sprintf(" %d", i+1),
 			ParentID: &root.ID,
@@ -186,7 +170,7 @@ func unitList(i int) []string {
 var categoryNames = strings.Fields("Бытовая техника Электроника Одежда Обувь Аксессуары Косметика Спорт Книги Игрушки Мебель")
 
 // DeterministicReport — вспомогательный отчёт для проверки детерминизма.
-func DeterministicReport(ds *Dataset) string {
+func DeterministicReport(ds *model.Dataset) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "products=%d offers=%d categories=%d\n", len(ds.Products), len(ds.Offers), len(ds.Categories))
 	for _, p := range ds.Products {
